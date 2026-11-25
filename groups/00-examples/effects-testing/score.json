@@ -1,0 +1,28 @@
+{
+  "title": "Effects testing",
+  "group": "Examples",
+  "theme": "One cowbell through four effect chains: delay, high-pass, feedback delay, reverb",
+  "members": ["Gabriel Vigliensoni"],
+  "groups": 4,
+  "sounds": {
+    "cowbell-minipops": "audio/cowbell-minipops.wav"
+  },
+  "effects": {
+    "A": [{ "type": "delay", "time": 0.375, "feedback": 0.5, "mix": 0.4 }],
+    "B": [{ "type": "highpass", "frequency": 2500, "q": 4 }],
+    "C": [{ "type": "delay", "time": 0.1875, "feedback": 0.85, "mix": 0.4 }],
+    "D": [{ "type": "reverb", "decay": 12, "mix": 0.5 }]
+  },
+  "events": [
+    { "at": "0:00", "groups": "A", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:01", "groups": "B", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:02", "groups": "C", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:03", "groups": "D", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:04", "groups": "B", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:05", "groups": "C", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:06", "groups": "D", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:07", "groups": "A", "play": "cowbell-minipops", "fade": 0, "loop": false },
+    { "at": "0:20", "groups": "all", "stop": "all", "fade": 0 }
+  ],
+  "end": "00:30"
+}

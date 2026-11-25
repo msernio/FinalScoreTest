@@ -1,0 +1,34 @@
+{
+  "pieces": [
+    {
+      "path": "00-examples/crickets",
+      "title": "Crickets",
+      "group": "Examples",
+      "theme": "A cricket passed around four groups, one through a sweeping filter",
+      "members": [
+        "Gabriel Vigliensoni"
+      ],
+      "example": true
+    },
+    {
+      "path": "00-examples/effects-testing",
+      "title": "Effects testing",
+      "group": "Examples",
+      "theme": "One cowbell through four effect chains: delay, high-pass, feedback delay, reverb",
+      "members": [
+        "Gabriel Vigliensoni"
+      ],
+      "example": true
+    },
+    {
+      "path": "00-examples/ptc-01",
+      "title": "PTC 01",
+      "group": "Examples",
+      "theme": "Instruments of Productions Totem Contemporain, slowly out of phase",
+      "members": [
+        "Gabriel Vigliensoni"
+      ],
+      "example": true
+    }
+  ]
+}

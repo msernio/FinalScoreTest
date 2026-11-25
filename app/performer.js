@@ -1,0 +1,508 @@
+// ═══════════════════════════════════════════════════════════════════════════════
+// PERFORMER — one phone, one member of a group.
+// Estimates its offset to the conductor's clock, then plays its group's part
+// of the score, turning every "at shared time T" into an exact AudioContext time.
+// ═══════════════════════════════════════════════════════════════════════════════
+
+const room = params.get('room');
+const T = room ? topics(room) : null;
+
+const store = {
+  get(k)    { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} },
+};
+
+// One id per tab (survives a reload, but two tabs on one device are two phones)
+const myId = (() => {
+  try {
+    const id = sessionStorage.getItem('c04e-id') || randomId(8);
+    sessionStorage.setItem('c04e-id', id);
+    return id;
+  } catch (e) { return randomId(8); }
+})();
+
+let trimMs = +(store.get('c04e-trim') || 0); // manual latency trim, + = play earlier
+
+let client = null;
+let ctx = null, master = null;
+let scoreBus = null; // the score's sounds go through here, so the conductor can mute a group
+let state = null;   // latest state message from the conductor
+let joined = false;
+let lastPong = 0;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLOCK SYNC — NTP-style, over the broker
+// ═══════════════════════════════════════════════════════════════════════════════
+const samples = []; // { rtt, off, at }
+let offset = 0, jitter = null, minRtt = null, synced = false;
+
+function sendPing() {
+  if (client && client.connected) client.publish(T.ping, JSON.stringify({ id: myId, t0: localNow() }));
+}
+
+function onPong(m) {
+  const t1 = localNow(), rtt = t1 - m.t0;
+  if (!(rtt >= 0 && rtt < 5000)) return;
+  lastPong = t1;
+  samples.push({ rtt, off: m.tc - (m.t0 + rtt / 2), at: t1 });
+  while (samples.length > 40) samples.shift();
+
+  // The fastest round trips are the most symmetric ones: trust those.
+  const best = samples.filter(s => t1 - s.at < 90000).sort((a, b) => a.rtt - b.rtt).slice(0, 5);
+  const offs = best.map(s => s.off).sort((a, b) => a - b);
+  offset = offs[Math.floor(offs.length / 2)];
+  jitter = (offs[offs.length - 1] - offs[0]) / 2;
+  minRtt = best[0].rtt;
+
+  if (!synced && samples.length >= 6) { synced = true; applyState(); }
+}
+
+const sharedNow = () => localNow() + offset;
+
+// Shared time (ms) → AudioContext time (s) at which that moment is *heard*.
+function ctxTimeFor(tShared) {
+  const ts = ctx.getOutputTimestamp ? ctx.getOutputTimestamp() : null;
+  let ctxT, perfT, outLat = 0;
+  // Some browsers (older Safari especially) report bogus output timestamps;
+  // only trust them when they agree with the live clocks to within 0.5 s.
+  const sane = ts && ts.contextTime > 0 && ts.performanceTime > 0 &&
+    Math.abs(ts.performanceTime - performance.now()) < 500 &&
+    Math.abs(ts.contextTime - ctx.currentTime) < 0.5;
+  if (sane) {
+    ctxT = ts.contextTime; perfT = ts.performanceTime;       // already includes output latency
+  } else {
+    ctxT = ctx.currentTime; perfT = performance.now();
+    outLat = ctx.outputLatency || ctx.baseLatency || 0;
+  }
+  const localPerf = tShared - offset - performance.timeOrigin;
+  return ctxT + (localPerf - perfT) / 1000 - outLat - trimMs / 1000;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SOUNDS
+// ═══════════════════════════════════════════════════════════════════════════════
+// Buffers are keyed by URL: the scores in scores.js use the built-in sounds, a
+// piece loaded from a link its own (from its folder, which may be a student's
+// repo), and the same id can mean different files.
+const buffers = new Map(); // url → Promise<AudioBuffer>
+const ready = new Set();   // urls decoded
+
+function getBufferURL(url) {
+  if (!buffers.has(url)) {
+    buffers.set(url, fetch(url)
+      .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+      .then(d => ctx.decodeAudioData(d))
+      .then(b => { decoded.set(url, b); ready.add(url); sendPresence(); return b; })
+      .catch(e => { buffers.delete(url); throw e; }));
+  }
+  return buffers.get(url);
+}
+
+// The URL of one of the score's sounds (S.source is the folder of
+// a piece loaded from a link; null for the scores in scores.js)
+const scoreURL = (S, n) => soundURL(n, S.score, S.source);
+const scoreURLs = S => compiledFor(S).sounds.map(n => scoreURL(S, n));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// PLAYBACK
+// ═══════════════════════════════════════════════════════════════════════════════
+let applying = Promise.resolve();
+function applyState() { applying = applying.then(doApply, doApply); }
+
+async function doApply() {
+  const S = state;
+  if (!joined || !synced || !S) return renderStatus();
+  if (!S.playing) { stopScore(S.stopAt); return renderStatus(); }
+  await applyScore(S);
+  renderStatus();
+}
+// The whole piece arrives in one message; this phone keeps the layers of its
+// own group and schedules every fade and drift change ahead.
+// ═══════════════════════════════════════════════════════════════════════════════
+let run = null; // { key, epoch, nodes, seatK, S, comp, group, rank, chain, chainKey }
+let compiled = { json: null, comp: null };
+
+function compiledFor(S) {
+  const json = JSON.stringify(S.score);
+  if (compiled.json !== json) compiled = { json, comp: compileScore(S.score) };
+  return compiled.comp;
+}
+
+function myAssign(S) { return (S.assign && S.assign[myId]) || null; }
+function isMuted(S) { const a = myAssign(S); return !!(a && S.muted && S.muted.includes(a[0])); }
+
+let missingMine = []; // URLs of this phone's sounds that couldn't be loaded
+
+async function applyScore(S) {
+  const comp = compiledFor(S);
+  const a = myAssign(S);
+  if (!a) { stopScore(0); return; }
+  const [group, rank] = a;
+  const mine = comp.layers.filter(L => L.group === group);
+  scoreBus.gain.setTargetAtTime(isMuted(S) ? 0 : 1, ctx.currentTime, 0.05);
+
+  // Play whatever loaded: a missing file (a typo in the score, or not pushed
+  // to the repo yet) silences only its own sound, and shows in the status
+  const urls = [...new Set(mine.map(L => scoreURL(S, L.sound)))];
+  const got = await Promise.allSettled(urls.map(getBufferURL));
+  if (state !== S) return;
+  missingMine = urls.filter((u, i) => got[i].status === 'rejected');
+
+  const key = [S.epoch, group, rank, JSON.stringify(S.overrides || [])].join('|');
+  if (run && run.key === key) { run.S = S; return; }
+  scheduleScore(S, comp, group, rank, key, !!(run && run.epoch === S.epoch));
+}
+
+// Build every node for this phone's layers, from "now" to the end of the piece.
+function scheduleScore(S, comp, group, rank, key, smooth) {
+  let ts = sharedNow() + 150;
+  let at = ctxTimeFor(ts);
+  const earliest = ctx.currentTime + 0.03;
+  if (at < earliest) { ts += (earliest - at) * 1000; at = earliest; }
+  const st  = (ts - S.T0) / 1000;               // score time at `at`
+  const c   = t => at + (t - st);               // score time → context time
+  const fade = smooth ? 0.03 : 0.005;
+
+  if (run) fadeOutNodes(run.nodes, at, fade);
+
+  // The group's effect chain. Kept while the same piece plays in the same
+  // group (re-seats, drift overrides), so reverb and echo tails carry on.
+  const chainKey = [S.epoch, group, JSON.stringify(comp.effects[group] || [])].join('|');
+  let chain = run && run.chainKey === chainKey ? run.chain : null;
+  if (!chain) {
+    if (run) retireChain(ctx, run.chain, at + fade);
+    chain = buildChain(ctx, comp.effects[group], scoreBus);
+  }
+  scheduleChain(chain, st, at, c);
+
+  const nodes = scheduleLayers(ctx, comp, {
+    group, rank, st, at, smooth, fade, overrides: S.overrides,
+    bufferFor: L => bufferNow(scoreURL(S, L.sound)), destination: chain.input,
+  });
+  run = { key, epoch: S.epoch, nodes, seatK: at - ts / 1000, S, comp, group, rank, chain, chainKey };
+}
+
+function fadeOutNodes(nodes, at, fade) {
+  for (const n of nodes) {
+    try {
+      const g = n.gain.gain;
+      if (g.cancelAndHoldAtTime) g.cancelAndHoldAtTime(at);
+      else { g.cancelScheduledValues(at); g.setValueAtTime(g.value, at); }
+      n.gain.gain.linearRampToValueAtTime(0, at + fade);
+      n.src.stop(at + fade + 0.02);
+    } catch (e) {}
+  }
+}
+
+function stopScore(tShared) {
+  if (!run) return;
+  const at = Math.max(ctxTimeFor(tShared || 0), ctx.currentTime + 0.005);
+  fadeOutNodes(run.nodes, at, 0.02);
+  retireChain(ctx, run.chain, at);
+  run = null;
+}
+
+// Decoded buffers, synchronously (applyScore awaited them already)
+const decoded = new Map();
+function bufferNow(url) { return (url && decoded.get(url)) || null; }
+
+// Audio hardware clocks and system clocks drift apart (tens of ppm), and the
+// clock-offset estimate keeps improving. Every few seconds, check how far the
+// running sounds have slipped from where they should be; past 20 ms, re-seat them.
+let driftMs = 0;
+function checkDrift() {
+  if (!synced || !run) return;
+  const X = sharedNow() + 200;
+  driftMs = ((ctxTimeFor(X) - X / 1000) - run.seatK) * 1000;
+  if (Math.abs(driftMs) > 20) {
+    scheduleScore(run.S, run.comp, run.group, run.rank, run.key, true);
+    driftMs = 0;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// NETWORK
+// ═══════════════════════════════════════════════════════════════════════════════
+function sendPresence() {
+  if (!client || !client.connected) return;
+  client.publish(T.presence, JSON.stringify({
+    id: myId, rtt: minRtt, jitter,
+    lat: ctx ? ((ctx.outputLatency || ctx.baseLatency || 0) * 1000) : null,
+    ready: state ? scoreURLs(state).every(u => ready.has(u)) : false,
+    assign: state ? myAssign(state) : null,
+  }));
+}
+
+function connect() {
+  client = connectBroker('perf-' + myId + '-' + randomId(3), {
+    topic: T.presence, payload: JSON.stringify({ id: myId, gone: true }), qos: 0, retain: false,
+  });
+  client.on('connect', () => {
+    client.subscribe([T.state, T.pong(myId), T.calib]);
+    // Burst of pings for a quick first estimate
+    for (let i = 0; i < 15; i++) setTimeout(sendPing, i * 120);
+    sendPresence();
+    renderStatus();
+  });
+  client.on('reconnect', () => setStatus('RECONNECTING…'));
+  client.on('offline',   () => setStatus('OFFLINE'));
+  client.on('message', (topic, buf) => {
+    const m = safeParse(buf);
+    if (!m) return;
+    if (topic === T.pong(myId)) return onPong(m);
+    if (topic === T.state) {
+      if (m.v !== 2) return;
+      state = m;
+      // Start downloading the whole score's sounds
+      scoreURLs(m).forEach(u => getBufferURL(u).catch(() => {}));
+      return applyState();
+    }
+    if (topic === T.calib) onCalib(m);
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// JOIN (needs a tap: browsers only start audio after a user gesture)
+// ═══════════════════════════════════════════════════════════════════════════════
+// ── Keep the screen on ────────────────────────────────────────────────────────
+// A locked phone drops off the broker, so the screen must never sleep. The
+// system can take the wake lock back (low battery, a notification, a call),
+// so ask again whenever it's released and check periodically. Browsers
+// without Wake Lock, or where the request fails, fall back to a tiny muted
+// looping video, which also keeps most phones awake.
+let wakeLock = null, wakePending = false, keepVideo = null;
+
+async function keepAwake() {
+  if (!joined || document.visibilityState !== 'visible') return;
+  if (wakeLock && !wakeLock.released) return;
+  if ('wakeLock' in navigator && !wakePending) {
+    wakePending = true;
+    try {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; setTimeout(keepAwake, 1000); });
+      wakePending = false;
+      return;
+    } catch (e) { wakePending = false; }
+  }
+  playKeepVideo();
+}
+
+function playKeepVideo() {
+  if (!keepVideo) {
+    keepVideo = document.createElement('video');
+    keepVideo.src = 'keepawake.mp4';
+    keepVideo.muted = true; keepVideo.loop = true;
+    keepVideo.setAttribute('playsinline', ''); keepVideo.setAttribute('muted', '');
+    keepVideo.className = 'keep-video';
+    document.body.appendChild(keepVideo);
+  }
+  if (keepVideo.paused) keepVideo.play().catch(() => {});
+}
+
+async function join() {
+  // iOS: play through the silent switch
+  try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
+  // Older iOS: a looping silent <audio> element also switches to the "playback" session
+  try {
+    const silent = new Audio('data:audio/wav;base64,UklGRkQDAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YSADAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==');
+    silent.loop = true; silent.setAttribute('playsinline', '');
+    silent.play().catch(() => {});
+  } catch (e) {}
+
+  ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
+  master = ctx.createGain();
+  master.gain.value = +document.getElementById('volCtrl').value;
+  master.connect(ctx.destination);
+  scoreBus = ctx.createGain();
+  scoreBus.connect(master);
+  await ctx.resume();
+  const unlock = ctx.createBufferSource();          // prime the output on iOS
+  unlock.buffer = ctx.createBuffer(1, 1, ctx.sampleRate);
+  unlock.connect(ctx.destination); unlock.start();
+
+  joined = true;
+  keepAwake();
+  document.body.classList.add('joined');
+
+  connect();
+
+  setInterval(sendPing, 2500);
+  setInterval(sendPresence, 3000);
+  setInterval(checkDrift, 4000);
+  setInterval(renderStatus, 1000);
+  setInterval(keepAwake, 10000);
+  requestAnimationFrame(renderLoop);
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !ctx) return;
+  ctx.resume();
+  keepAwake();
+  sendPresence(); // tell the conductor we're back (clears "asleep")
+  for (let i = 0; i < 6; i++) setTimeout(sendPing, i * 150);
+  setTimeout(checkDrift, 1200);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// UI
+// ═══════════════════════════════════════════════════════════════════════════════
+// Plays a short beep right now, ignoring the conductor: checks that this
+// phone can make sound at all (volume, silent switch, audio unlocked).
+function testSound() {
+  if (!ctx) return;
+  ctx.resume();
+  beep(ctx.currentTime + 0.02);
+  flash(0);
+  renderStatus();
+}
+
+// The test sound, at AudioContext time t. Goes through `master`, so the
+// Volume slider sets its level (that's what calibration adjusts).
+function beep(t) {
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.value = 880;
+  g.gain.setValueAtTime(0, t);
+  g.gain.linearRampToValueAtTime(0.5, t + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+  o.connect(g).connect(master);
+  o.start(t); o.stop(t + 0.45);
+  return o;
+}
+
+// Flash the screen in `ms`, so the room can see which phone is sounding
+let flashTimer = null;
+function flash(ms) {
+  clearTimeout(flashTimer);
+  flashTimer = setTimeout(() => {
+    document.body.classList.add('pinged');
+    flashTimer = setTimeout(() => document.body.classList.remove('pinged'), 400);
+  }, Math.max(0, ms));
+}
+
+// Level calibration: the conductor sends the start time and the order of
+// phones; this phone plays its test sound on its own turn.
+let calibBeep = null;
+function onCalib(m) {
+  if (calibBeep) { try { calibBeep.stop(); } catch (e) {} calibBeep = null; }
+  const i = (m.order || []).indexOf(myId);
+  if (i < 0 || !joined || !synced) return;
+  const tShared = m.t0 + i * m.gap;
+  const at = ctxTimeFor(tShared);
+  if (at < ctx.currentTime - 0.1) return; // arrived after our turn: skip rather than play out of order
+  ctx.resume();
+  calibBeep = beep(Math.max(at, ctx.currentTime + 0.01));
+  flash(tShared - sharedNow());
+}
+
+function updateVol() {
+  const v = +document.getElementById('volCtrl').value;
+  document.getElementById('volVal').textContent = v.toFixed(2);
+  if (master) master.gain.setTargetAtTime(v, ctx.currentTime, 0.02);
+}
+
+function updateTrim() {
+  trimMs = +document.getElementById('trimCtrl').value;
+  store.set('c04e-trim', trimMs);
+  document.getElementById('trimVal').textContent = (trimMs > 0 ? '+' : '') + trimMs + ' ms';
+  // checkDrift() notices the change and re-seats the running sounds
+}
+
+let statusOverride = null;
+function setStatus(txt) { statusOverride = txt; renderStatus(); }
+
+function renderStatus() {
+  const el = document.getElementById('statusTxt');
+  if (!el) return;
+  let txt;
+  if (!room) txt = 'NO ROOM — OPEN THE LINK FROM THE CONDUCTOR';
+  else if (!client || !client.connected) txt = statusOverride || 'CONNECTING…';
+  else if (!synced) txt = localNow() - lastPong > 5000 && samples.length === 0
+    ? 'WAITING FOR CONDUCTOR' : 'SYNCING CLOCK…';
+  else if (state && !myAssign(state)) txt = 'WAITING FOR A GROUP…';
+  else if (!state || !state.playing) txt = 'READY — WAITING FOR START';
+  else {
+    const st = (sharedNow() - state.T0) / 1000, comp = compiledFor(state);
+    txt = ctx.state !== 'running' ? 'AUDIO BLOCKED — TAP “TEST SOUND”'
+        : st < 0 ? 'COUNT-IN…' : st > comp.end ? 'END' : isMuted(state) ? 'MUTED' : 'PLAYING';
+    if (missingMine.length) txt += ` · COULD NOT LOAD ${missingMine.map(u => decodeURI(u.split('/').pop())).join(', ')}`;
+  }
+  if (client && client.connected) statusOverride = null;
+  el.textContent = txt;
+
+  const credit = document.getElementById('creditTxt');
+  if (credit) credit.textContent = creditLine(state && state.score);
+
+  const stats = document.getElementById('statsTxt');
+  if (stats) stats.textContent = synced
+    ? `sync ±${jitter.toFixed(1)} ms · rtt ${Math.round(minRtt)} ms · drift ${driftMs.toFixed(1)} ms`
+    : '';
+}
+
+function renderLoop() {
+  drawRing(document.getElementById('ring'), state ? scoreHands(state) : []);
+  renderIdentity();
+  renderStandby();
+  requestAnimationFrame(renderLoop);
+}
+
+// The ring shows the loudest sound in my group: my hand vs. phone 1's
+function scoreHands(S) {
+  const nowTxt = document.getElementById('nowTxt');
+  if (!run || !S.playing || !synced) { if (nowTxt) nowTxt.textContent = ''; return []; }
+  const st = (sharedNow() - S.T0) / 1000;
+  let best = null, bestG = 0.001;
+  for (const n of run.nodes) {
+    const done = layerDone(n.L, n.drift, run.rank, st, n.buffer.duration, run.comp.spread);
+    const g = st >= n.L.start && st <= n.L.stop && !done ? valueAt(n.L.gain, st) : 0;
+    if (g > bestG) { best = n; bestG = g; }
+  }
+  if (nowTxt) nowTxt.textContent = st < 0 ? `starts in ${Math.ceil(-st)} s`
+    : fmtTime(st) + (best ? ` · sound ${best.L.sound} · ratio ${(1 + valueAt(best.drift, st)).toFixed(4)}`
+      + ` · spread ${(1 + valueAt(run.comp.spread, st)).toFixed(4)}` : ' · resting');
+  if (!best) return [];
+  const dur = best.buffer.duration, col = groupColor(run.group, run.comp.groups), sp = run.comp.spread;
+  const hands = [{ pos: layerPos(best.L, best.drift, 1, st, dur, sp) / dur, color: themeColor('--mid'), width: 2 }];
+  if (run.rank !== 1) hands.unshift({ pos: layerPos(best.L, best.drift, run.rank, st, dur, sp) / dur, color: col, width: 4 });
+  else hands[0] = { ...hands[0], color: col, width: 4 };
+  return hands;
+}
+
+// ── Standby: the conductor blacks out every screen between pieces ─────────────
+// Phones stay awake, connected and synced (and still play and flash); only the
+// display goes dark. Tapping the black screen shows the normal view briefly.
+let peekUntil = 0;
+function peek() { peekUntil = localNow() + 5000; }
+
+function renderStandby() {
+  const on = !!(state && state.standby) && joined && localNow() > peekUntil;
+  document.body.classList.toggle('standby', on);
+  if (!on) return;
+  const dot = document.getElementById('standbyDot');
+  const cls = !client || !client.connected ? 'off' : !synced ? 'wait' : 'ok';
+  if (dot.dataset.state !== cls) dot.dataset.state = cls;
+}
+
+// Big label: this phone's group letter, and its number in the group
+function renderIdentity() {
+  const big = document.getElementById('voiceBig'), sub = document.getElementById('subTxt');
+  const a = state && myAssign(state);
+  const txt = a ? a[0] : '·';
+  if (big.textContent !== txt) big.textContent = txt;
+  big.style.color = a ? groupColor(a[0], compiledFor(state).groups) : themeColor('--mid');
+  sub.textContent = a ? `Group · phone ${a[1]}` : 'Group';
+}
+
+function themeChanged() {
+  toggleTheme();
+  document.getElementById('themeBtn').textContent =
+    document.documentElement.dataset.theme === 'dark' ? '◐' : '◑';
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+document.getElementById('roomTxt').textContent = room || '—';
+document.getElementById('trimCtrl').value = trimMs;
+updateTrim();
+if (!room) {
+  document.getElementById('joinBtn').disabled = true;
+  renderStatus();
+}
