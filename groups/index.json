@@ -2,7 +2,7 @@
   "pieces": [
     {
       "path": "00-examples/crickets",
-      "title": "Crickets",
+      "title": "Test",
       "group": "Examples",
       "theme": "A cricket passed around four groups, one through a sweeping filter",
       "members": [
@@ -21,7 +21,7 @@
       "example": true
     },
     {
-      "path": "00-examples/ptc-01",
+      "path": "ForeignDevice",
       "title": "PTC 01",
       "group": "Examples",
       "theme": "Instruments of Productions Totem Contemporain, slowly out of phase",
