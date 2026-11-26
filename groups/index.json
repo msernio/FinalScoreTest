@@ -21,8 +21,8 @@
       "example": true
     },
     {
-      "path": "ForeignDevice",
-      "title": "PTC 01",
+      "path": "00-examples/ForeignDevice",
+      "title": "Final Score",
       "group": "Examples",
       "theme": "Instruments of Productions Totem Contemporain, slowly out of phase",
       "members": [
